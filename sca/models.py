@@ -18,9 +18,9 @@ import torch.nn.functional as F
 
 import geotorch
 
-from sca.util import torchify
+from sca.util import torchify, dict_torchify, concatenate_region_dict
 from sca.loss_funcs import my_loss, my_loss_norm
-from sca.architectures import LowROrth, LowRNorm
+from sca.architectures import LowROrth, LowRNorm, mLowRNorm
 
 from tqdm import tqdm
 
@@ -410,7 +410,16 @@ class SCA(object):
     """
 
 
-    def __init__(self,n_components=None,lam_sparse=None,lr=None,n_epochs=3000,orth=False,lam_orthog=None,init=None,scheduler_params_input=dict()):
+    def __init__(
+            self,
+            n_components=None,
+            lam_sparse=None,
+            lr=None,
+            n_epochs=3000,
+            orth=False,
+            lam_orthog=None,
+            init=None,
+            scheduler_params_input=dict()):
 
          self.n_components = n_components
          self.lam_sparse=lam_sparse
@@ -683,3 +692,218 @@ class SCA(object):
         [X_torch] = torchify([X])
         latent, y_pred = self.model(X_torch)
         return y_pred.detach().numpy()
+
+
+class mSCA(SCA):
+    def __init__(self, filter_length, **kwargs):
+        super(mSCA, self).__init__(**kwargs)
+        self.filter_length=filter_length
+    
+    def fit_transform(
+            self,
+            X,
+            Y=None,
+            sample_weight=None):
+
+            # Require the dimensionality
+            if self.n_components is None:
+                raise Exception("Error: you must include a value for n_components, the number \
+                    of low-dimensional components")
+
+            # Require dictionary specifying regions
+            if not isinstance(X, dict):
+                raise Exception("Error: X must be dictionary e.g. \
+                    {'Region1': [np.array(trial1), ...], 'Region2': [np.array(trial1), ...]} \
+                    OR {'Region1': np.array(region1_data), 'Region2': np.array(region2_data)}"
+                )
+
+            # If not using trials, convert single array to list containing that array
+            if isinstance(next(iter(X.values())), np.ndarray):
+                X = {k: [v] for k, v in X.items()}
+                     
+            #If sample_weight is None, create uniform sample weights for every trial
+            if sample_weight is None:
+                sample_weight = {k: [np.ones(vt.shape[0]) for vt in v] for k, v in X.items()}
+
+            #Include input scheduler params
+            self.scheduler_params={
+                'use_scheduler': True,
+                'factor': .5,
+                'min_lr': 5e-4,
+                'patience': 100,
+                'threshold':1e-6,
+                'threshold_mode':'rel'
+            }
+            for key in self.scheduler_params_input.keys():
+                self.scheduler_params[key]=self.scheduler_params_input[key]
+
+            # Initialize the region-specific portions of the encoder using PCA
+            if Y is None:
+                U, V = [], []
+                for reg_name, reg_trials in X.items():
+                    reg_trials = np.concatenate(reg_trials, axis=0)
+                    reg_sw = np.concatenate(sample_weight[reg_name], axis=0).reshape(-1,1)
+                    reg_wpca = WeightedPCA(self.n_components)
+                    reg_wpca.fit(reg_trials, reg_sw)
+                    U.append(reg_wpca.params['U']), V.append(reg_wpca.params['V'])
+
+                # Combine region-specific initialized
+                U_est_pca, V_est_pca = np.concatenate(U, axis=0), np.concatenate(V, axis=1)
+                b_est=np.zeros(U_est_pca.shape[0])
+            else:
+                # Only supporting reconstruction 
+                # TODO: update to support prediction i.e. output Y not X
+                raise NotImplementedError
+
+            #Initialize weights (either with PCA/RRR weights from above, or randomly)
+            if Y is None:
+                if self.init is None or self.init=='pca':
+                    U_est=np.copy(U_est_pca)
+                    V_est=np.copy(V_est_pca)
+                elif self.init=='rand':
+                    # Only supporting PCA initialization currently
+                    # TODO: update to support random initialization
+                    raise NotImplementedError
+                else:
+                    raise Exception("Invalid initialization: options are 'pca' or 'rand' ")
+            else:
+                # Only supporting reconstruction right now
+                raise NotImplementedError
+
+
+            #Set default learning rate:
+            #.001 if initializing weights w/ PCA/RRR and .01 if random weights
+            if self.lr is None:
+                if self.init=='rand':
+                    self.lr=.01
+                else:
+                    self.lr=.001
+
+            #Set default lam_sparse:
+            #It is set so that the initial sparsity penalty (based on PCA or RRR initialization) is 10% of the reconstruction error
+            if self.lam_sparse is None:
+                if Y is None:
+                    full_X = concatenate_region_dict(X)
+                    pca_latent = full_X@U_est_pca
+                    pca_recon=pca_latent@V_est_pca
+                    self.lam_sparse = .1*np.sum((full_X-pca_recon)**2)/np.sum(np.abs(pca_latent))
+                    print('Using lam_sparse= ', self.lam_sparse)
+                else:
+                    # TODO: update to support output other than the input
+                    raise NotImplementedError
+
+            #Set default lam_orthog:
+            #It is set so that the orthogonality penalty would be 10% of the PCA/RRR squared error if all off-diag values of V.T@V were 0.1
+            if self.orth is False:
+                if self.lam_orthog is None:
+                    if self.n_components==1:
+                        self.lam_orthog=0
+                    else:
+                        if Y is None:
+                            pca_recon=full_X@U_est@V_est
+                            self.lam_orthog = .1*np.sum((full_X-pca_recon)**2)/np.sum(self.n_components*(self.n_components-1)*.01)
+                        else:
+                            rrr_recon=X@U_est@V_est
+                            self.lam_orthog = .1*np.sum((Y-rrr_recon)**2)/np.sum(self.n_components*(self.n_components-1)*.01)
+                    print('Using lam_orthog= ', self.lam_orthog)
+
+            #To make the rest generic, we will predict Y from X, where Y=X in the scenario that Y has not been input
+            if Y is None:
+                Y=X
+
+            # move to GPU if available
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            print("Using device", device)
+
+            #Declare the model and optimizer TODO: update to support orthogonality constraint
+            print('Only using orthog penalty, not constraint')
+            model = mLowRNorm(
+                full_X.shape[1],
+                full_X.shape[1],            # TODO: Assuming only reconstruction of inputs
+                self.n_components,
+                U_est.T,
+                b_est,
+                n_regions=len(X),
+                filter_length=self.filter_length
+            ).to(device)
+
+            # Declare the optimizer
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr = self.lr
+            )
+
+            #Initialize V in the model
+            model.fc2.weight = torch.tensor(
+                V_est.T,
+                dtype=torch.float
+            ).to(device)
+
+            #Create torch tensors of our variables
+            [X_torch,Y_torch,sample_weight_torch] = dict_torchify([X, Y, sample_weight])
+
+            # Make the scheduler
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                patience=self.scheduler_params['patience'],
+                factor=self.scheduler_params['factor'],
+                min_lr=self.scheduler_params['min_lr'],
+                threshold=self.scheduler_params['threshold'],
+                threshold_mode=self.scheduler_params['threshold_mode']
+            )
+
+            #Get initial model loss before training
+            model.eval()
+            
+            latent, y_pred = model(X_torch)
+            if self.orth: # TODO: not currently supporting this
+                before_train = my_loss(y_pred, Y_torch, latent, self.lam_sparse, sample_weight_torch)
+            else:
+                before_train = my_loss_norm(y_pred, Y_torch, latent, model.fc2.weight, self.lam_sparse, self.lam_orthog, sample_weight_torch)
+
+            #Fit the model!
+
+            # t1=time.time()
+            losses=np.zeros(self.n_epochs+1) #Save loss at each training epoch
+            losses[0]=before_train.item()
+
+            model.train()
+            for epoch in tqdm(range(self.n_epochs), position=0, leave=True):
+                optimizer.zero_grad()
+                # Forward pass
+                latent, y_pred = model(X_torch)
+                # Compute Loss
+                if self.orth:
+                    loss = my_loss(y_pred, Y_torch, latent, self.lam_sparse, sample_weight_torch)
+                else:
+                    loss = my_loss_norm(y_pred, Y_torch, latent, model.fc2.weight, self.lam_sparse, self.lam_orthog, sample_weight_torch)
+                losses[epoch+1]=loss.item()
+
+                # Backward pass
+                loss.backward()
+                optimizer.step()
+                if self.scheduler_params['use_scheduler']:
+                    scheduler.step(loss.item())
+            # print('time',time.time()-t1)
+
+            # Include attributes as part of self
+            self.model=model
+            self.losses=losses
+
+            self.params={}
+            self.params['U']=model.fc1.weight.detach().numpy().T
+            self.params['b_u']=model.fc1.bias.detach().numpy()
+            self.params['V']=model.fc2.weight.detach().numpy().T
+            self.params['b_v']=model.fc2.bias.detach().numpy()
+
+            self.r2_score=r2_score(Y,y_pred.detach().numpy(),sample_weight=sample_weight,multioutput='variance_weighted')
+            self.reconstruction_loss=np.sum((sample_weight*(y_pred.detach().numpy() - Y))**2)
+
+            #Explained squared activity
+            sq_activity=[np.sum((latent[:,i:i+1].detach().numpy()@model.fc2.weight[:,i:i+1].detach().numpy().T)**2) for i in range(self.n_components)]
+            self.explained_squared_activity = np.array(sq_activity)
+
+            return latent.detach().numpy()
+
+        
+            print('something')

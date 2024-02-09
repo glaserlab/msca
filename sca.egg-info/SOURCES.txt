@@ -1,0 +1,13 @@
+LICENSE
+README.md
+setup.py
+sca/__init__.py
+sca/architectures.py
+sca/loss_funcs.py
+sca/models.py
+sca/util.py
+sca.egg-info/PKG-INFO
+sca.egg-info/SOURCES.txt
+sca.egg-info/dependency_links.txt
+sca.egg-info/requires.txt
+sca.egg-info/top_level.txt

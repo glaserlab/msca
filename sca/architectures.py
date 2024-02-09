@@ -134,3 +134,52 @@ class LowRNorm(nn.Module):
         hidden = self.fc1(x)
         output = self.fc2(hidden)
         return hidden, output
+
+# Used to clamp stddev > 1
+class Clamp(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        return input.clamp(min=1, max=torch.inf)
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.clone()
+
+class mLowRNorm(LowRNorm):
+    def __init__(self, *args, n_regions=2, filter_length=41):
+        super(mLowRNorm, self).__init__(*args)
+        self.filter_length = filter_length
+        self.n_regions = n_regions
+
+        # Learned filter params
+        self.mus = torch.nn.Parameter(
+            torch.zeros(self.n_regions, self.hidden_size)
+        )
+        self.sigmas = torch.nn.Parameter(
+            torch.ones(self.n_regions, self.hidden_size)
+        )
+        self.scaling = torch.nn.Parameter(
+            torch.ones(self.n_regions, self.hidden_size)
+        )
+
+        # X-values used for evaluating the filters
+        self._x_vals = torch.arange(
+            -self.filter_length//2,
+            self.filter_length//2
+        )
+
+    def encode_region(self, reg_num, x_r, d0, d1):
+        z_r = (x_r @ self.fc1.weight[d0:d1])
+        print('something')
+
+    def encode(self, x):
+        zs, d0 = [], 0
+
+        ### TODO: problem is that we need a single-trial for first loss computation
+        for reg_num, (r, x_r) in enumerate(x.items()):
+            d1 = d0 + x_r.shape[1]
+            zs.append(self.encode_region(reg_num, x_r, d0, d1))
+
+    def forward(self, x):
+        zs = self.encode(x)
+        print('something')

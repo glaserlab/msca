@@ -56,6 +56,11 @@ def torchify(array_list):
 
     return [torch.tensor(array_entry, dtype=torch.float).to(device) for array_entry in array_list]
 
+def dict_torchify(dict_array_list):
+    for i, elem in enumerate(dict_array_list):
+        dict_array_list[i] = {k: torchify(v) for k, v in elem.items()}
+    return dict_array_list
+
 
 def get_accuracy(self,X,sample_weight=None):
 
@@ -68,3 +73,7 @@ def get_accuracy(self,X,sample_weight=None):
         reconstruction_loss=np.sum((sample_weight*(Xhat - X))**2)
 
     return [r2,reconstruction_loss]
+
+
+def concatenate_region_dict(X):
+    return np.concatenate([np.concatenate(v, axis=0) for _, v in X.items()], axis=1)
