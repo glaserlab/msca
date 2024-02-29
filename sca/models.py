@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 import geotorch
 
-from sca.util import torchify, dict_torchify, concatenate_region_dict
+from sca.util import torchify, dict_torchify, concatenate_region_dict, list_of_dicts, combine_dict_list, trim, combine_region_dict
 from sca.loss_funcs import my_loss, my_loss_norm
 from sca.architectures import LowROrth, LowRNorm, mLowRNorm
 
@@ -699,6 +699,16 @@ class mSCA(SCA):
         super(mSCA, self).__init__(**kwargs)
         self.filter_length=filter_length
     
+    def reconstruct(self, X):
+        X_torch = dict_torchify([X])[0]
+        X_torch = list_of_dicts(X_torch)
+        out = {k: [] for k, _ in X.items()}
+        for tri_num, x_torch in enumerate(X_torch):
+            _, x_hat = self.model(x_torch)
+            for k, v in x_hat.items():
+                out[k].append(v)
+        return out
+
     def fit_transform(
             self,
             X,
@@ -723,7 +733,7 @@ class mSCA(SCA):
                      
             #If sample_weight is None, create uniform sample weights for every trial
             if sample_weight is None:
-                sample_weight = {k: [np.ones(vt.shape[0]) for vt in v] for k, v in X.items()}
+                sample_weight = {k: [np.ones((vt.shape[0], 1)) for vt in v] for k, v in X.items()}
 
             #Include input scheduler params
             self.scheduler_params={
@@ -742,7 +752,7 @@ class mSCA(SCA):
                 U, V = [], []
                 for reg_name, reg_trials in X.items():
                     reg_trials = np.concatenate(reg_trials, axis=0)
-                    reg_sw = np.concatenate(sample_weight[reg_name], axis=0).reshape(-1,1)
+                    reg_sw = np.concatenate(sample_weight[reg_name], axis=0)
                     reg_wpca = WeightedPCA(self.n_components)
                     reg_wpca.fit(reg_trials, reg_sw)
                     U.append(reg_wpca.params['U']), V.append(reg_wpca.params['V'])
@@ -781,9 +791,10 @@ class mSCA(SCA):
 
             #Set default lam_sparse:
             #It is set so that the initial sparsity penalty (based on PCA or RRR initialization) is 10% of the reconstruction error
+            full_X = concatenate_region_dict(X)
+
             if self.lam_sparse is None:
                 if Y is None:
-                    full_X = concatenate_region_dict(X)
                     pca_latent = full_X@U_est_pca
                     pca_recon=pca_latent@V_est_pca
                     self.lam_sparse = .1*np.sum((full_X-pca_recon)**2)/np.sum(np.abs(pca_latent))
@@ -853,41 +864,84 @@ class mSCA(SCA):
             )
 
             #Get initial model loss before training
-            model.eval()
+            # model.eval()
             
-            latent, y_pred = model(X_torch)
-            if self.orth: # TODO: not currently supporting this
-                before_train = my_loss(y_pred, Y_torch, latent, self.lam_sparse, sample_weight_torch)
-            else:
-                before_train = my_loss_norm(y_pred, Y_torch, latent, model.fc2.weight, self.lam_sparse, self.lam_orthog, sample_weight_torch)
+            # Converting a dictionary with list values to a list of dictionaries
+            X_torch = list_of_dicts(X_torch)
+            Y_torch = list_of_dicts(Y_torch)
+            sample_weight_torch = list_of_dicts(sample_weight_torch)
+            # sample_weight_torch = combine_region_dict(sample_weight_torch)
+
+            # Iterate through all trials
+            latents, y_preds = [], []
+            for trial in X_torch:            
+                latent, y_pred = model(trial)
+                latents.append(latent), y_preds.append(y_pred)
+            
+            # Combine across trials - don't want to overwrite these
+            first_y_pred = combine_dict_list(y_preds)
+            first_latents = combine_dict_list(latents)
+            first_Y_torch = combine_dict_list(
+                Y_torch,
+                filter_length=self.filter_length
+            )
+            first_sample_weight_torch = combine_dict_list(
+                sample_weight_torch,
+                filter_length=self.filter_length
+            )
+            
+            # Iterate over regions and add to compute the loss
+            before_train = 0
+            for reg_num, (reg_name, pred) in enumerate(first_y_pred.items()):
+                before_train += my_loss_norm(
+                    pred,
+                    first_Y_torch[reg_name],
+                    first_latents[reg_name],
+                    model.fc2.weight,
+                    self.lam_sparse,
+                    self.lam_orthog,
+                    first_sample_weight_torch[reg_name].reshape(-1,1)
+                )
 
             #Fit the model!
-
-            # t1=time.time()
             losses=np.zeros(self.n_epochs+1) #Save loss at each training epoch
             losses[0]=before_train.item()
 
             model.train()
             for epoch in tqdm(range(self.n_epochs), position=0, leave=True):
-                optimizer.zero_grad()
-                # Forward pass
-                latent, y_pred = model(X_torch)
-                # Compute Loss
-                if self.orth:
-                    loss = my_loss(y_pred, Y_torch, latent, self.lam_sparse, sample_weight_torch)
-                else:
-                    loss = my_loss_norm(y_pred, Y_torch, latent, model.fc2.weight, self.lam_sparse, self.lam_orthog, sample_weight_torch)
-                losses[epoch+1]=loss.item()
+                # Iterate through trials
+                for trial in X_torch:
+                    optimizer.zero_grad()
+                    
+                    # Forward pass through each trial - stepping every trial rn
+                    for tri_num, trial in enumerate(X_torch):            
+                        latent, y_pred = model(trial)
 
-                # Backward pass
-                loss.backward()
-                optimizer.step()
-                if self.scheduler_params['use_scheduler']:
-                    scheduler.step(loss.item())
-            # print('time',time.time()-t1)
+                        # Compute loss for each region
+                        loss = 0
+                        for reg_num, (reg_name, pred) in enumerate(y_pred.items()):
+                            loss += my_loss_norm(
+                                pred,
+                                trim(Y_torch[tri_num][reg_name], self.filter_length),
+                                latent[reg_name],
+                                model.fc2.weight,
+                                self.lam_sparse,
+                                self.lam_orthog,
+                                trim(sample_weight_torch[tri_num][reg_name], self.filter_length)
+                            )
+                    
+                    losses[epoch+1]=loss.item()
+
+                    # Backward pass
+                    loss.backward()
+                    optimizer.step()
+                    if self.scheduler_params['use_scheduler']:
+                        scheduler.step(loss.item())
+                
 
             # Include attributes as part of self
             self.model=model
+            self.model.trained=True
             self.losses=losses
 
             self.params={}
@@ -896,14 +950,50 @@ class mSCA(SCA):
             self.params['V']=model.fc2.weight.detach().numpy().T
             self.params['b_v']=model.fc2.bias.detach().numpy()
 
-            self.r2_score=r2_score(Y,y_pred.detach().numpy(),sample_weight=sample_weight,multioutput='variance_weighted')
-            self.reconstruction_loss=np.sum((sample_weight*(y_pred.detach().numpy() - Y))**2)
+            # Get predictions over all trials
+            y_preds, latents = [], []
+            for trial in X_torch:            
+                latent, y_pred = model(trial)
+                y_preds.append(y_pred)
+                latents.append(latent)
+            
+            # Combine across trials
+            y_preds = combine_dict_list(y_preds)
+            Y_torch = combine_dict_list(
+                Y_torch,
+                filter_length=self.filter_length
+            )
+            sample_weight_torch = combine_dict_list(
+                sample_weight_torch,
+                filter_length=self.filter_length
+            )
+            cat_latents = torch.cat(latents, dim=0).detach()
+            
+            # TODO: only allowing for equal weighting across regions
+            first_reg_key = list(sample_weight_torch.keys())[0]
+            sample_weight_torch = sample_weight_torch[first_reg_key]
 
-            #Explained squared activity
-            sq_activity=[np.sum((latent[:,i:i+1].detach().numpy()@model.fc2.weight[:,i:i+1].detach().numpy().T)**2) for i in range(self.n_components)]
+            # Combine across regions to compute reconstruction and r2
+            y_preds = combine_region_dict(y_preds)
+            Y_torch = combine_region_dict(Y_torch)
+
+            # Compute the R2 score across both regions
+            self.r2_score = r2_score(
+                Y_torch,
+                y_preds,
+                sample_weight=sample_weight_torch,
+                multioutput='variance_weighted'
+            )
+
+            # Compute the reconstruction loss 
+            self.reconstruction_loss=(
+                sample_weight_torch * (y_preds - Y_torch)
+            ) ** 2
+
+            # Explain the squared activity
+            sq_activity=[np.sum((
+                cat_latents[:,i:i+1].detach().numpy()@model.fc2.weight[:,i:i+1].detach().numpy().T)**2) for i in range(self.n_components)
+            ]
             self.explained_squared_activity = np.array(sq_activity)
 
-            return latent.detach().numpy()
-
-        
-            print('something')
+            return [latent.detach().numpy() for latent in latents]

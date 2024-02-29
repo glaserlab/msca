@@ -6,6 +6,7 @@ import copy
 import time
 
 import torch
+from torch.utils.data import Dataset
 from sklearn.metrics import r2_score
 
 
@@ -77,3 +78,24 @@ def get_accuracy(self,X,sample_weight=None):
 
 def concatenate_region_dict(X):
     return np.concatenate([np.concatenate(v, axis=0) for _, v in X.items()], axis=1)
+
+
+def list_of_dicts(X):
+    """TODO: probably a simpler way to write this"""
+    trial_data = list(zip(*[v for _, v in X.items()]))
+    return [{k: trial[i] for i, k in enumerate(X.keys())} for trial in trial_data]
+
+def combine_dict_list(X, filter_length=0):
+    combined = {k: [] for k, _ in X[0].items()}
+    if filter_length:
+        [combined[k].append(trim(v, filter_length)) for list_item in X  for k, v in list_item.items()]
+    else:
+        [combined[k].append(v) for list_item in X  for k, v in list_item.items()]
+
+    return {k: torch.cat(v) for k, v in combined.items()}
+
+def combine_region_dict(X):
+    return torch.cat([v for _, v in X.items()], axis=1).detach().numpy()
+
+def trim(X, filter_length):
+    return X[filter_length-1:-filter_length+1]
